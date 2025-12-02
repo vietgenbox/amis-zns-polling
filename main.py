@@ -73,7 +73,7 @@ def get_orders(access_token):
 # Gửi ZNS qua API Render của bạn
 # ------------------------------------------------------
 def send_zns(order):
-    url = "https://your-render-domain.onrender.com/send"
+    url = "https://amis-zns-polling.onrender.com/send"
 
     payload = {
         "phone": order.get("phone"),
@@ -132,3 +132,4 @@ def run_polling():
 
 if __name__ == "__main__":
     run_polling()
+
