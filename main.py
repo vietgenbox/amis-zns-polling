@@ -13,7 +13,7 @@ AMIS_REFRESH_TOKEN = os.environ.get("AMIS_REFRESH_TOKEN")
 ZALO_ACCESS_TOKEN = os.environ.get("ZALO_ACCESS_TOKEN")
 ZALO_TEMPLATE_ID = os.environ.get("ZALO_TEMPLATE_ID")
 
-RENDER_ZNS_URL = os.environ.get("RENDER_ZNS_URL", "https://your-render-domain.onrender.com/send")
+RENDER_ZNS_URL = os.environ.get("RENDER_ZNS_URL", "https://amis-zns-polling.onrender.com/send")
 
 STATE_FILE = "state.json"
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))  # default 300s
@@ -222,3 +222,4 @@ def run_polling():
 
 if __name__ == "__main__":
     run_polling()
+
