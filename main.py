@@ -2,7 +2,10 @@ import time
 import requests
 import json
 import os
+import sys
+from datetime import datetime
 
+# --- ENV ---
 AMIS_CLIENT_ID = os.environ.get("AMIS_CLIENT_ID")
 AMIS_CLIENT_SECRET = os.environ.get("AMIS_CLIENT_SECRET")
 AMIS_REFRESH_TOKEN = os.environ.get("AMIS_REFRESH_TOKEN")
@@ -10,126 +13,212 @@ AMIS_REFRESH_TOKEN = os.environ.get("AMIS_REFRESH_TOKEN")
 ZALO_ACCESS_TOKEN = os.environ.get("ZALO_ACCESS_TOKEN")
 ZALO_TEMPLATE_ID = os.environ.get("ZALO_TEMPLATE_ID")
 
-STATE_FILE = "state.json"
+RENDER_ZNS_URL = os.environ.get("RENDER_ZNS_URL", "https://your-render-domain.onrender.com/send")
 
+STATE_FILE = "state.json"
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))  # default 300s
+
+# Simple helper for timestamped prints
+def log(*args, **kwargs):
+    print(f"[{datetime.now().isoformat()}]", *args, **kwargs)
+    sys.stdout.flush()
 
 # ------------------------------------------------------
-# Load trạng thái cũ từ file
+# Load / Save state
 # ------------------------------------------------------
 def load_state():
     try:
-        with open(STATE_FILE, "r") as f:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log("Error loading state file:", e)
         return {}
 
-
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
-
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log("Error saving state file:", e)
 
 # ------------------------------------------------------
-# Lấy access token mới từ refresh token
+# Lấy access token mới từ refresh token (robust)
 # ------------------------------------------------------
-def refresh_access_token():
-    url = "https://crmconnect.misa.vn/api/v2/account/refreshtoken"
-
+def refresh_access_token(retries=3):
+    url = "https://crmconnect.misa.vn/api/v2/account/"
     payload = {
         "client_id": AMIS_CLIENT_ID,
         "client_secret": AMIS_CLIENT_SECRET,
         "refresh_token": AMIS_REFRESH_TOKEN
     }
-
     headers = {"Content-Type": "application/json"}
 
-    res = requests.post(url, json=payload, headers=headers)
-    data = res.json()
+    for attempt in range(1, retries + 1):
+        try:
+            log("Requesting refreshed access token, attempt", attempt)
+            res = requests.post(url, json=payload, headers=headers, timeout=15)
+        except Exception as e:
+            log("Network error when requesting token:", e)
+            if attempt < retries:
+                time.sleep(2 * attempt)
+                continue
+            raise
 
-    return data["data"]["access_token"]
+        log("Token endpoint status:", res.status_code)
+        text = res.text or ""
+        log("Token endpoint response body (truncated):", text[:1000])
 
+        # Try parse JSON safely
+        try:
+            j = res.json()
+        except ValueError:
+            # Not JSON — return None or raise with context
+            log("Token endpoint did not return JSON. Aborting token refresh.")
+            raise RuntimeError(f"Token endpoint returned non-JSON: HTTP {res.status_code}: {text[:1000]}")
+
+        # Try extract token from common shapes:
+        # shape1: { "data": { "access_token": "...", "refresh_token":"..." } , "success": true }
+        # shape2: { "access_token": "...", "refresh_token":"..." }
+        if isinstance(j, dict):
+            if "data" in j and isinstance(j["data"], dict) and "access_token" in j["data"]:
+                return j["data"]["access_token"]
+            if "access_token" in j:
+                return j["access_token"]
+            # some error wrapper:
+            log("Token endpoint JSON but no access_token key. JSON keys:", list(j.keys()))
+            raise RuntimeError(f"Token endpoint JSON missing access_token: {j}")
+
+        # default
+        raise RuntimeError(f"Unexpected token response format: {j}")
 
 # ------------------------------------------------------
-# Lấy danh sách đơn hàng từ AMIS CRM (SaleOrders)
+# Lấy danh sách SaleOrders (robust)
 # ------------------------------------------------------
-def get_orders(access_token):
+def get_saleorders(access_token):
     url = "https://crmconnect.misa.vn/api/v2/SaleOrders"
-
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json"
     }
-
-    res = requests.get(url, headers=headers)
-    data = res.json()
-
     try:
-        return data["data"]["SaleOrders"]
-    except:
-        return []
+        res = requests.get(url, headers=headers, timeout=20)
+    except Exception as e:
+        log("Network error when requesting SaleOrders:", e)
+        return None, f"network-error: {e}"
 
+    log("SaleOrders endpoint status:", res.status_code)
+    text = res.text or ""
+    log("SaleOrders response body (truncated):", text[:1000])
+
+    # If not JSON, return error info
+    try:
+        j = res.json()
+    except ValueError:
+        return None, f"non-json-response: HTTP {res.status_code} body: {text[:1000]}"
+
+    # Expecting j["data"]["SaleOrders"] or j["data"]
+    if isinstance(j, dict):
+        if "data" in j:
+            data = j["data"]
+            # if data contains SaleOrders
+            if isinstance(data, dict) and "SaleOrders" in data:
+                return data["SaleOrders"], None
+            # if data is a list directly
+            if isinstance(data, list):
+                return data, None
+            # fallback: if j itself contains SaleOrders
+        if "SaleOrders" in j:
+            return j["SaleOrders"], None
+
+    return None, f"unexpected-json-shape: keys={list(j.keys())}"
 
 # ------------------------------------------------------
-# Gửi ZNS qua API Render của bạn
+# Gửi ZNS tới Render (robust)
 # ------------------------------------------------------
 def send_zns(order):
-    url = "https://amis-zns-polling.onrender.com/send"
-
+    url = RENDER_ZNS_URL
     payload = {
         "phone": order.get("phone"),
-        "account_name": order.get("account_name"),
+        "account_name": order.get("account_name") or order.get("contact_name") or order.get("account_name"),
         "sale_order_no": order.get("sale_order_no"),
         "shipping_address": order.get("shipping_address"),
-        "sale_order_amount": str(order.get("sale_order_amount"))
+        "sale_order_amount": str(order.get("sale_order_amount", order.get("sale_order_amount", "")))
     }
-
     headers = {"Content-Type": "application/json"}
 
     try:
-        requests.post(url, json=payload, headers=headers)
-        print("Đã gửi ZNS:", order["sale_order_no"])
+        r = requests.post(url, json=payload, headers=headers, timeout=15)
+        log("Posted to Render:", r.status_code, r.text[:1000])
+        return True
     except Exception as e:
-        print("Lỗi gửi ZNS:", e)
-
+        log("Error posting to Render:", e)
+        return False
 
 # ------------------------------------------------------
-# Worker Polling Loop
+# Main polling loop
 # ------------------------------------------------------
 def run_polling():
+    if not (AMIS_CLIENT_ID and AMIS_CLIENT_SECRET and AMIS_REFRESH_TOKEN):
+        log("Missing AMIS credentials. Please set AMIS_CLIENT_ID/AMIS_CLIENT_SECRET/AMIS_REFRESH_TOKEN env vars.")
+        return
+
+    if not (ZALO_ACCESS_TOKEN and ZALO_TEMPLATE_ID):
+        log("Warning: ZALO_ACCESS_TOKEN or ZALO_TEMPLATE_ID missing; send_zns will likely fail.")
+
     state = load_state()
 
     while True:
-        print("Đang cập nhật…")
+        log("=== POLL START ===")
+        try:
+            access_token = refresh_access_token()
+        except Exception as e:
+            log("Failed to refresh access token:", e)
+            log(f"Sleeping {POLL_INTERVAL}s and retrying...")
+            time.sleep(POLL_INTERVAL)
+            continue
 
-        # 1. Lấy access token mới
-        access_token = refresh_access_token()
+        orders, err = get_saleorders(access_token)
+        if err:
+            log("Error getting SaleOrders:", err)
+            log(f"Sleeping {POLL_INTERVAL}s and retrying...")
+            time.sleep(POLL_INTERVAL)
+            continue
 
-        # 2. Lấy danh sách đơn hàng
-        orders = get_orders(access_token)
-
-        # 3. So sánh trạng thái giao hàng
+        # process orders
         for order in orders:
+            # Use sale_order_no as unique key
+            oid = order.get("sale_order_no")
+            if not oid:
+                # skip records without order number
+                log("Skipping order without sale_order_no:", order)
+                continue
 
-            oid = order["sale_order_no"]  # Sử dụng số đơn hàng làm ID
             current_status = order.get("delivery_status", "")
+            old_status = state.get(oid)
 
-            old_status = state.get(oid, "")
+            # first time see this order -> store and don't send
+            if old_status is None:
+                state[oid] = current_status
+                log(f"Seen first time: {oid} status={current_status} (no ZNS)")
+                continue
 
             if old_status != current_status:
-                print(f"Đơn {oid} đổi trạng thái: {old_status} → {current_status}")
-
-                # Nếu chuyển từ Chưa giao hàng → Đang giao hàng
+                log(f"Order {oid} changed: {old_status} -> {current_status}")
+                # send when Chưa giao hàng -> Đang giao hàng
                 if old_status == "Chưa giao hàng" and current_status == "Đang giao hàng":
-                    send_zns(order)
-
-                # Lưu trạng thái mới
+                    ok = send_zns(order)
+                    if ok:
+                        log("ZNS sent for", oid)
+                    else:
+                        log("Failed to send ZNS for", oid)
+                # update stored status
                 state[oid] = current_status
 
         save_state(state)
-
-        time.sleep(300)   # 5 phút
-
+        log("=== POLL END, sleeping", POLL_INTERVAL, "seconds ===")
+        time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
     run_polling()
-
